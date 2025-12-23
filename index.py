@@ -1,235 +1,229 @@
-import requests
-import io
 import threading
-import platform
-import webbrowser
 import re
-import os
+import requests
 from urllib.parse import urlparse
+from kivy.lang import Builder
+from kivy.utils import platform
+from kivy.clock import Clock
+from kivymd.app import MDApp
+from kivymd.uix.card import MDCard
+from kivymd.uix.label import MDLabel
+from kivymd.uix.button import MDRaisedButton
+from kivy.uix.screenmanager import Screen, ScreenManager
+from kivy.properties import StringProperty
+from kivy.uix.video import Video # <--- Internal Video Widget
 
-try:
-    import tkinter as tk
-    from tkinter import ttk, messagebox
-except ImportError:
-    import Tkinter as tk
-    import ttk
-    import messagebox
+# --- SCREENS ---
+class BrowseScreen(Screen): pass
+class DetailScreen(Screen): pass
+class PlayerScreen(Screen): pass # <--- New Video Screen
 
-from PIL import Image, ImageTk
-import mpv # Requires: brew install mpv && pip install python-mpv
+class MovieCard(MDCard):
+    title = StringProperty("")
+    poster = StringProperty("")
+    movie_id = StringProperty("")
 
-class MovieViewer:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Movie2k Explorer (Integrated Player)")
-        self.root.geometry("1100x850")
-        self.root.configure(bg="#1a1a1a")
+# --- UI (KV) ---
+KV = '''
+ScreenManager:
+    BrowseScreen:
+    DetailScreen:
+    PlayerScreen:
 
-        self.browse_url = "https://movie2k.ch/data/browse/"
-        self.watch_url = "https://movie2k.ch/data/watch/"
-        self.img_base = "https://image.tmdb.org/t/p/w500"
+<MovieCard>:
+    orientation: "vertical"
+    padding: "8dp"
+    size_hint: None, None
+    size: "160dp", "280dp"
+    ripple_behavior: True
+    on_release: app.show_details(root.movie_id)
+    AsyncImage:
+        source: root.poster
+        allow_stretch: True
+    MDLabel:
+        text: root.title
+        font_style: "Caption"
+        halign: "center"
+        size_hint_y: None
+        height: "40dp"
+
+<BrowseScreen>:
+    name: "browse"
+    MDBoxLayout:
+        orientation: "vertical"
+        MDTopAppBar:
+            title: "Movie2k Explorer"
+            right_action_items: [["refresh", lambda x: app.load_movies()]]
+        ScrollView:
+            MDGridLayout:
+                id: movie_grid
+                cols: 2
+                adaptive_height: True
+                padding: "10dp"
+                spacing: "10dp"
+        MDBoxLayout:
+            size_hint_y: None
+            height: "50dp"
+            MDRaisedButton:
+                text: "PREV"
+                on_release: app.change_page(-1)
+            MDLabel:
+                text: "Page " + str(app.current_page)
+                halign: "center"
+            MDRaisedButton:
+                text: "NEXT"
+                on_release: app.change_page(1)
+
+<DetailScreen>:
+    name: "details"
+    MDBoxLayout:
+        orientation: "vertical"
+        MDTopAppBar:
+            title: "Details"
+            left_action_items: [["arrow-left", lambda x: app.go_back()]]
+        ScrollView:
+            MDBoxLayout:
+                orientation: "vertical"
+                adaptive_height: True
+                padding: "20dp"
+                spacing: "20dp"
+                AsyncImage:
+                    id: detail_poster
+                    size_hint_y: None
+                    height: "350dp"
+                MDLabel:
+                    id: detail_title
+                    font_style: "H5"
+                    halign: "center"
+                MDBoxLayout:
+                    id: stream_container
+                    orientation: "vertical"
+                    adaptive_height: True
+                    spacing: "10dp"
+
+<PlayerScreen>:
+    name: "player"
+    MDBoxLayout:
+        orientation: "vertical"
+        MDTopAppBar:
+            title: "Internal Player"
+            left_action_items: [["close", lambda x: app.stop_video()]]
         
-        self.current_page = 1
-        self.headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        # The Video Widget
+        Video:
+            id: video_player
+            state: 'pause'
+            allow_stretch: True
+            options: {'eos': 'stop'}
+        
+        MDBoxLayout:
+            size_hint_y: None
+            height: "60dp"
+            padding: "10dp"
+            MDRaisedButton:
+                text: "PLAY/PAUSE"
+                on_release: video_player.state = 'play' if video_player.state == 'pause' else 'pause'
+'''
 
-        self.setup_ui()
-        self.show_browse_view()
+class MovieApp(MDApp):
+    current_page = 1
+    
+    def build(self):
+        self.theme_cls.theme_style = "Dark"
+        self.theme_cls.primary_palette = "Red"
+        self.headers = {"User-Agent": "Mozilla/5.0"}
+        return Builder.load_string(KV)
 
-    # --- SCRAPER ---
-    def get_hls_manifest(self, landing_url):
-        try:
-            response = requests.get(landing_url, headers=self.headers, timeout=10)
-            match = re.search(r'file\s*:\s*"([^"]+master\.m3u8[^"]+)"', response.text)
-            return match.group(1) if match else None
-        except:
-            return None
+    def on_start(self):
+        self.load_movies()
 
-    # --- INTEGRATED MPV PLAYER ---
-    def open_internal_player(self, stream_url):
-        # Create a popup loading window
-        loading = tk.Toplevel(self.root)
-        loading.title("Loading Stream")
-        loading.geometry("300x100")
-        tk.Label(loading, text="Extracting HLS Manifest...").pack(pady=30)
-        loading.update()
+    def load_movies(self):
+        self.root.get_screen('browse').ids.movie_grid.clear_widgets()
+        threading.Thread(target=self._fetch_movies, daemon=True).start()
 
-        def task():
-            hls_url = self.get_hls_manifest(stream_url)
-            loading.destroy()
-            if not hls_url:
-                self.root.after(0, lambda: messagebox.showerror("Error", "Could not find video stream."))
-                return
-            self.root.after(0, lambda: self.create_mpv_window(hls_url))
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def create_mpv_window(self, m3u8_url):
-        player_win = tk.Toplevel(self.root)
-        player_win.title("Integrated Player")
-        player_win.geometry("960x540")
-        player_win.configure(bg="black")
-
-        # Container for MPV
-        video_frame = tk.Frame(player_win, bg="black")
-        video_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Force window rendering to get a valid ID
-        player_win.update()
-
-        # Initialize MPV with the frame's window ID
-        # On macOS, mpv handles the embedding much more gracefully than VLC
-        try:
-            player = mpv.MPV(
-                wid=str(video_frame.winfo_id()),
-                osc=True,      # Show the built-in on-screen controller
-                ytdl=False,    # We are providing the direct m3u8
-                input_default_bindings=True,
-                input_vo_keyboard=True
-            )
-
-            player.play(m3u8_url)
-
-            def on_close():
-                player.terminate() # Properly shut down the engine
-                player_win.destroy()
-
-            player_win.protocol("WM_DELETE_WINDOW", on_close)
-        except Exception as e:
-            messagebox.showerror("MPV Error", f"Failed to initialize MPV engine: {e}")
-            player_win.destroy()
-
-    # --- UI RENDERING ---
-    def setup_ui(self):
-        self.header = tk.Frame(self.root, bg="#111111", pady=20)
-        self.header.pack(fill=tk.X)
-        tk.Label(self.header, text="MOVIE2K EXPLORER", fg="#e74c3c", bg="#111111", font=("Arial", 24, "bold")).pack()
-
-        self.container = tk.Frame(self.root, bg="#1a1a1a")
-        self.container.pack(fill="both", expand=True)
-
-        self.canvas = tk.Canvas(self.container, bg="#1a1a1a", highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self.container, orient="vertical", command=self.canvas.yview)
-        self.view_frame = tk.Frame(self.canvas, bg="#1a1a1a")
-
-        self.view_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.view_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-
-        self.footer = tk.Frame(self.root, bg="#111111", pady=15)
-        self.footer.pack(fill=tk.X)
-        self.btn_prev = self.create_custom_button(self.footer, " << PREV ", "#34495e", self.prev_page)
-        self.btn_prev.pack(side=tk.LEFT, padx=40)
-        self.page_label = tk.Label(self.footer, text="PAGE 1", fg="white", bg="#111111", font=("Arial", 12, "bold"))
-        self.page_label.pack(side=tk.LEFT, expand=True)
-        self.btn_next = self.create_custom_button(self.footer, " NEXT >> ", "#34495e", self.next_page)
-        self.btn_next.pack(side=tk.RIGHT, padx=40)
-
-        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def create_custom_button(self, parent, text, color, command, width=15):
-        btn = tk.Label(parent, text=text, bg=color, fg="white", font=("Arial", 10, "bold"), pady=8, width=width, cursor="hand2")
-        btn.bind("<Button-1>", lambda e: command())
-        return btn
-
-    def _on_mousewheel(self, event):
-        if platform.system() == 'Darwin': self.canvas.yview_scroll(-1 * event.delta, "units")
-
-    def show_browse_view(self):
-        self.footer.pack(fill=tk.X)
-        for widget in self.view_frame.winfo_children(): widget.destroy()
-        tk.Label(self.view_frame, text="Loading trending...", fg="#bdc3c7", bg="#1a1a1a").pack(pady=100, padx=400)
-        threading.Thread(target=self.load_browse_data, daemon=True).start()
-
-    def load_browse_data(self):
+    def _fetch_movies(self):
+        url = "https://movie2k.ch/data/browse/"
         params = {"lang": 2, "order_by": "trending", "page": self.current_page, "limit": 20}
         try:
-            res = requests.get(self.browse_url, params=params, headers=self.headers, timeout=10).json()
-            self.root.after(0, lambda: self.render_browse(res.get('movies', [])))
+            res = requests.get(url, params=params, headers=self.headers, timeout=10).json()
+            Clock.schedule_once(lambda dt: self._populate_grid(res.get('movies', [])))
         except: pass
 
-    def render_browse(self, movies):
-        for widget in self.view_frame.winfo_children(): widget.destroy()
-        grid = tk.Frame(self.view_frame, bg="#1a1a1a")
-        grid.pack(padx=20, pady=20)
-        cols = 2
-        for i, m in enumerate(movies):
-            row, col = i // cols, i % cols
-            card = tk.Frame(grid, bg="#262626", padx=10, pady=10, cursor="hand2")
-            card.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
-            card.bind("<Button-1>", lambda e, id=m.get('_id'): self.show_detail_view(id))
-            tk.Label(card, text=m.get('title'), font=("Arial", 10, "bold"), fg="white", bg="#262626", wraplength=200).grid(row=1, column=0)
-            if m.get('poster_path'): self.load_image(self.img_base + m.get('poster_path'), card, (200, 300), click_id=m.get('_id'), row=0)
+    def _populate_grid(self, movies):
+        grid = self.root.get_screen('browse').ids.movie_grid
+        for m in movies:
+            card = MovieCard()
+            card.movie_id = str(m.get('_id', ''))
+            card.title = m.get('title', 'No Title')
+            if m.get('poster_path'):
+                card.poster = f"https://image.tmdb.org/t/p/w500{m.get('poster_path')}"
+            grid.add_widget(card)
 
-    def show_detail_view(self, movie_id):
-        self.footer.pack_forget()
-        for widget in self.view_frame.winfo_children(): widget.destroy()
-        threading.Thread(target=self.load_detail_data, args=(movie_id,), daemon=True).start()
+    def show_details(self, movie_id):
+        self.root.current = "details"
+        screen = self.root.get_screen('details')
+        screen.ids.stream_container.clear_widgets()
+        threading.Thread(target=self._fetch_details, args=(movie_id,), daemon=True).start()
 
-    def load_detail_data(self, movie_id):
-        res = requests.get(self.watch_url, params={"_id": movie_id}, headers=self.headers, timeout=10).json()
-        self.root.after(0, lambda: self.render_details(res))
+    def _fetch_details(self, movie_id):
+        url = "https://movie2k.ch/data/watch/"
+        try:
+            res = requests.get(url, params={"_id": movie_id}, headers=self.headers, timeout=10).json()
+            Clock.schedule_once(lambda dt: self.update_detail_ui(res))
+        except: pass
 
-    def render_details(self, data):
-        for widget in self.view_frame.winfo_children(): widget.destroy()
-        self.create_custom_button(self.view_frame, " ← BACK ", "#e74c3c", self.show_browse_view, width=15).pack(anchor="nw", padx=30, pady=20)
+    def update_detail_ui(self, data):
+        screen = self.root.get_screen('details')
+        if data.get('poster_path'):
+            screen.ids.detail_poster.source = f"https://image.tmdb.org/t/p/w500{data.get('poster_path')}"
+        screen.ids.detail_title.text = data.get('title', 'Unknown')
         
-        info = tk.Frame(self.view_frame, bg="#1a1a1a")
-        info.pack(fill=tk.X, padx=30)
-        if data.get('poster_path'): self.load_image(self.img_base + data.get('poster_path'), info, (250, 375), row=0)
-
-        # STREAMS: Priority to SaveFiles
-        playable = ["savefiles.com", "streamhls.to"]
-        streams = data.get('streams', [])
-        sorted_s = sorted(streams, key=lambda s: any(x in urlparse(s.get('stream','')).netloc.lower() for x in playable), reverse=True)
-
-        tk.Label(self.view_frame, text="AVAILABLE STREAMS", font=("Arial", 14, "bold"), fg="white", bg="#222", pady=10).pack(fill=tk.X, pady=20)
-
-        for s in sorted_s:
+        container = screen.ids.stream_container
+        for s in data.get('streams', []):
             url = s.get('stream', '')
-            domain = urlparse(url).netloc.lower()
-            is_playable = any(src in domain for src in playable)
-
-            row = tk.Frame(self.view_frame, bg="#262626", pady=5)
-            row.pack(fill=tk.X, padx=30, pady=2)
-            tk.Label(row, text=domain.upper(), font=("Arial", 10, "bold"), fg="#f1c40f", bg="#262626", width=25).pack(side=tk.LEFT)
+            domain = urlparse(url).netloc
+            if not domain: continue
             
-            if is_playable:
-                self.create_custom_button(row, " PLAY IN APP ", "#9b59b6", lambda u=url: self.open_internal_player(u), width=12).pack(side=tk.RIGHT, padx=5)
-            self.create_custom_button(row, " BROWSER ", "#27ae60", lambda u=url: webbrowser.open(u), width=10).pack(side=tk.RIGHT, padx=5)
+            # Button 1: Play Internal
+            container.add_widget(MDRaisedButton(
+                text=f"Play In-App ({domain})",
+                pos_hint={"center_x": .5},
+                on_release=lambda x, u=url: self.prepare_video(u)
+            ))
 
-    def load_image(self, url, parent, size, click_id=None, row=0):
-        def download():
+    def prepare_video(self, landing_url):
+        # Move to player screen and show "loading"
+        self.root.current = "player"
+        player = self.root.get_screen('player').ids.video_player
+        player.source = "" # Clear previous
+        
+        def task():
             try:
-                res = requests.get(url, timeout=5)
-                pil_img = Image.open(io.BytesIO(res.content))
-                pil_img.thumbnail(size)
-                self.root.after(0, lambda: self.display_image_safe(pil_img, parent, click_id, row))
+                res = requests.get(landing_url, headers=self.headers, timeout=10).text
+                match = re.search(r'file\s*:\s*"([^"]+master\.m3u8[^"]+)"', res)
+                if match:
+                    hls_url = match.group(1)
+                    Clock.schedule_once(lambda dt: self.start_video(hls_url))
             except: pass
-        threading.Thread(target=download, daemon=True).start()
+        threading.Thread(target=task, daemon=True).start()
 
-    def display_image_safe(self, pil_img, parent, click_id, row):
-        tk_img = ImageTk.PhotoImage(pil_img)
-        lbl = tk.Label(parent, image=tk_img, bg=parent.cget('bg'))
-        lbl.image = tk_img
-        lbl.grid(row=row, column=0)
-        if click_id: lbl.bind("<Button-1>", lambda e: self.show_detail_view(click_id))
+    def start_video(self, hls_url):
+        player = self.root.get_screen('player').ids.video_player
+        player.source = hls_url
+        player.state = 'play'
 
-    def next_page(self):
-        self.current_page += 1
-        self.page_label.config(text=f"PAGE {self.current_page}")
-        self.show_browse_view()
-        self.canvas.yview_moveto(0)
+    def stop_video(self):
+        player = self.root.get_screen('player').ids.video_player
+        player.state = 'stop'
+        player.unload()
+        self.root.current = "details"
 
-    def prev_page(self):
-        if self.current_page > 1:
-            self.current_page -= 1
-            self.page_label.config(text=f"PAGE {self.current_page}")
-            self.show_browse_view()
-            self.canvas.yview_moveto(0)
+    def change_page(self, delta):
+        self.current_page = max(1, self.current_page + delta)
+        self.load_movies()
+
+    def go_back(self):
+        self.root.current = "browse"
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = MovieViewer(root)
-    root.mainloop()
+    MovieApp().run()
