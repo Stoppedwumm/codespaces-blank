@@ -20,7 +20,7 @@ version = 0.1
 
 # (list) Application requirements
 # pyjnius is required for the Android Intent (video player) logic
-requirements = python3, kivy, kivymd, requests, urllib3, certifi, chardet, idna, pillow, pyjnius, ffpyplayer, ffpyplayer_codecs
+requirements = python3, kivy==2.3.0, kivymd==1.2.0, requests, urllib3, certifi, chardet, idna, pillow, ffpyplayer
 
 # (str) Supported orientation
 orientation = portrait
